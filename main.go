@@ -2,8 +2,8 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"compress/gzip"
+	"context"
 	"crypto/sha1"
 	"crypto/tls"
 	"encoding/hex"
@@ -36,6 +36,7 @@ var (
 
 	port         int
 	forwardPort  int
+	forwardProto string
 	cacheMaxAge  int
 	docBase      string
 	cacheMaxSize int64
@@ -52,6 +53,7 @@ func init() {
 	flag.StringVar(&docBase, "basedir", "/app/html", "base directory (defaults to '/app/html')")
 	flag.IntVar(&port, "port", 9998, "port to listen on (defaults to 9998)")
 	flag.IntVar(&forwardPort, "forwardPort", 9999, "port to forward non-static URL (defaults to 9999)")
+	flag.StringVar(&forwardProto, "forwardProto", "http", "protocol to forward non-static URL (defaults to 'http')")
 	flag.Int64Var(&cacheMaxSize, "maxsize", 500000, "max cache size in KB (defaults to 500,000)")
 	flag.BoolVar(&selfSigned, "selfsigned", false, "allow self-signed TLS certificates (defaults to false)")
 	flag.StringVar(&certFile, "cert", "/cert.crt", "location to the TLS certificate file (defaults to /cert.crt)")
@@ -135,7 +137,7 @@ func createShutdownHook(shutdown ShutdownHookFunc) chan bool {
 	signal.Notify(c, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		s := <-c
-		fmt.Printf("%v signal received, shutting down...\n", s)
+		log.Infof("%v signal received, shutting down...", s)
 		shutdown()
 		done <- true
 	}()
@@ -152,23 +154,28 @@ func findPushLinks(reader io.Reader) ([]string, string, error) {
 		return nil, "", err
 	}
 	urls := make([]string, 0)
+	nodes := make([]*html.Node, 0)
 	var visitor func(*html.Node)
 	visitor = func(node *html.Node) {
 		if node.Type == html.ElementNode && node.Data == "link" {
-			var relFound bool
+			var relFound, noPush bool
+			var href string
 			for _, a := range node.Attr {
 				if a.Key == "rel" {
-					if a.Val != "push" {
+					if a.Val == "push" || a.Val == "preload" {
+						relFound = true
+					} else {
 						break
 					}
-					relFound = true
+				} else if a.Key == "href" {
+					href = a.Val
+				} else if a.Key == "nopush" {
+					noPush = true
 				}
-				if relFound && a.Key == "href" {
-					urls = append(urls, a.Val)
-					// remove it since it's only for server side use
-					node.Parent.RemoveChild(node)
-					break
-				}
+			}
+			if relFound && noPush == false && href != "" {
+				urls = append(urls, href)
+				nodes = append(nodes, node)
 			}
 		}
 		for c := node.FirstChild; c != nil; c = c.NextSibling {
@@ -176,6 +183,10 @@ func findPushLinks(reader io.Reader) ([]string, string, error) {
 		}
 	}
 	visitor(doc)
+	for _, node := range nodes {
+		// remove it since it's only for server side use
+		node.Parent.RemoveChild(node)
+	}
 	var content bytes.Buffer
 	html.Render(&content, doc)
 	return urls, content.String(), nil
@@ -272,7 +283,7 @@ func stream(w http.ResponseWriter, req *http.Request, item *CacheItem) {
 // notfound will forward the request to the backend since we didn't handle it.
 // this allows the back-end to server any 404 logic and control the presentation
 func notfound(fwd *forward.Forwarder, w http.ResponseWriter, req *http.Request) {
-	req.URL = testutils.ParseURI(fmt.Sprintf("http://127.0.0.1:%d%s", forwardPort, req.URL))
+	req.URL = testutils.ParseURI(fmt.Sprintf("%s://127.0.0.1:%d%s", forwardProto, forwardPort, req.URL))
 	fwd.ServeHTTP(w, req)
 }
 
@@ -396,6 +407,22 @@ func main() {
 		srv.Shutdown(context.Background())
 	}
 
+	// in case anyone uses fatal
+	log.RegisterExitHandler(shutdown)
+
+	// create a shutdown hook handler
+	done := createShutdownHook(shutdown)
+
+	// start our webserver (in a separate go routine since it blocks)
+	go func() {
+		log.Infof("listening on %s, will proxy to :%d", srv.Addr, forwardPort)
+		err := srv.ListenAndServeTLS(certFile, keyFile)
+		if err != nil && err != http.ErrServerClosed {
+			log.Errorf("error HTTP listen %v", err)
+			os.Exit(1)
+		}
+	}()
+
 	//TEMP remove this once we have things all tidied up and working
 	go func() {
 		handler := func(w http.ResponseWriter, r *http.Request) {
@@ -406,19 +433,6 @@ func main() {
 		err := http.ListenAndServe(fmt.Sprintf(":%d", forwardPort), nil)
 		if err != nil {
 			fmt.Println(err)
-		}
-	}()
-
-	// create a shutdown hook handler
-	done := createShutdownHook(shutdown)
-
-	// start our webserver (in a separate go routine since it blocks)
-	go func() {
-		log.Infof("listening on %s", srv.Addr)
-		err := srv.ListenAndServeTLS(certFile, keyFile)
-		if err != nil && err != http.ErrServerClosed {
-			log.Errorf("error HTTP listen %v", err)
-			os.Exit(1)
 		}
 	}()
 
